@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Vision Streaming Demo</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; background:#0b1220; color:#f2f5f9; }
+    header { padding: 16px 20px; background:#11182a; border-bottom:1px solid #1a2340; }
+    main { padding: 20px; max-width: 1100px; margin: 0 auto; }
+    h1 { font-size: 18px; margin: 0; }
+    h2 { font-size: 16px; margin: 24px 0 8px; color: #9fb3ff; }
+    .card { background:#0f172a; border:1px solid #1a2340; border-radius: 10px; padding: 16px; margin: 12px 0; }
+    label { display:block; font-size:13px; color:#bcd; margin: 8px 0 4px; }
+    input[type=text], input[type=password], input[type=url] { width: 100%; padding:10px; border-radius:8px; border:1px solid #2a355b; background:#0c1326; color:#e9eef8; outline:none; }
+    input[type=text]:focus, input[type=password]:focus, input[type=url]:focus { border-color:#3a55ff; }
+    button { background:#3a55ff; color:#fff; border:none; padding:10px 14px; border-radius:8px; cursor:pointer; font-weight:600; }
+    button.secondary { background:#243055; }
+    button:disabled { opacity:.6; cursor:not-allowed; }
+    .row { display:flex; gap:12px; flex-wrap: wrap; }
+    .col { flex:1 1 320px; }
+    .status { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size:12px; background:#0c1326; border:1px solid #1a2340; border-radius:8px; padding:10px; height:120px; overflow:auto; white-space:pre-wrap; }
+    .videos { display:grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap:12px; margin-top: 12px; }
+    video { width: 100%; height: auto; background:#000; border-radius: 8px; border:1px solid #1a2340; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#152048; color:#cfe; font-size: 12px; border:1px solid #243055; }
+    .grid { display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Vision Streaming Demo</h1>
+  </header>
+  <main>
+    <div class="card">
+      <h2>Backend Settings</h2>
+      <div class="grid">
+        <div>
+          <label>Vision API Base (e.g. http://localhost:8000)</label>
+          <input id="apiBase" type="text" placeholder="http://localhost:8000" />
+        </div>
+        <div style="align-self:end; display:flex; gap:8px;">
+          <button id="saveApiBase">Save</button>
+          <span class="pill" id="apiBaseStatus">Not saved</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="col">
+        <div class="card">
+          <h2>Login</h2>
+          <label>User ID (owner_user_id)</label>
+          <input id="userId" type="text" placeholder="6928422b8c9933d948cfdc21" />
+          <div style="margin-top:10px; display:flex; gap:8px;">
+            <button id="loginBtn">Login</button>
+            <span class="pill" id="loginStatus">Not logged in</span>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Add Camera</h2>
+          <label>Camera ID (id)</label>
+          <input id="camId" type="text" placeholder="CAM-43C1E6AFB726" />
+          <label>Camera Name (name)</label>
+          <input id="camName" type="text" placeholder="home_camera" />
+          <label>RTSP URL (stream_url)</label>
+          <input id="camRtsp" type="url" placeholder="rtsp://user:pass@192.168.1.6:554/stream1" />
+          <label>Device ID (device_id, optional)</label>
+          <input id="camDevice" type="text" placeholder="DEV-790EECBE4CF2" />
+          <div style="margin-top:10px; display:flex; gap:8px;">
+            <button id="addCamBtn">Add / Update Camera</button>
+            <button id="listCamsBtn" class="secondary">List Cameras</button>
+          </div>
+          <div id="camsList" class="status" style="margin-top:10px;"></div>
+        </div>
+      </div>
+
+      <div class="col">
+        <div class="card">
+          <h2>Live Viewer</h2>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button id="startLiveBtn">Start Live</button>
+            <button id="stopLiveBtn" class="secondary">Stop</button>
+            <span class="pill" id="liveStatus">Idle</span>
+          </div>
+          <div class="videos" id="videos"></div>
+          <div class="status" id="log" style="margin-top:12px;"></div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const logEl = $('log');
+    const videosEl = $('videos');
+
+    function log(...args) {
+      const msg = args.map(a => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
+      logEl.textContent += msg + '\n';
+      logEl.scrollTop = logEl.scrollHeight;
+      console.log('[viewer]', ...args);
+    }
+
+    let API_BASE = localStorage.getItem('apiBase') || 'http://localhost:8000';
+    $('apiBase').value = API_BASE;
+    $('apiBaseStatus').textContent = 'Loaded';
+
+    $('saveApiBase').onclick = () => {
+      API_BASE = $('apiBase').value.trim() || API_BASE;
+      localStorage.setItem('apiBase', API_BASE);
+      $('apiBaseStatus').textContent = 'Saved';
+    };
+
+    let userId = '';
+    let ws = null;
+    let pc = null;
+    const streamsByCamera = new Map();
+
+    $('loginBtn').onclick = () => {
+      const id = $('userId').value.trim();
+      if (!id) { alert('Enter user id'); return; }
+      userId = id;
+      $('loginStatus').textContent = 'Logged in as ' + id;
+      log('Logged in:', id);
+    };
+
+    $('addCamBtn').onclick = async () => {
+      if (!userId) { alert('Login first'); return; }
+      const payload = {
+        id: $('camId').value.trim(),
+        owner_user_id: userId,
+        name: $('camName').value.trim(),
+        stream_url: $('camRtsp').value.trim(),
+        device_id: $('camDevice').value.trim() || null
+      };
+      if (!payload.id || !payload.name || !payload.stream_url) {
+        alert('Fill camera id, name and rtsp url'); return;
+      }
+      try {
+        const res = await fetch(API_BASE + '/api/cameras', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || res.statusText);
+        log('Camera saved:', data);
+        $('camsList').textContent = JSON.stringify(data, null, 2);
+      } catch (e) {
+        log('Add camera failed:', e.message || e);
+        alert('Add camera failed: ' + e);
+      }
+    };
+
+    $('listCamsBtn').onclick = async () => {
+      if (!userId) { alert('Login first'); return; }
+      try {
+        const res = await fetch(API_BASE + '/api/cameras?user_id=' + encodeURIComponent(userId));
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || res.statusText);
+        $('camsList').textContent = JSON.stringify(data, null, 2);
+        log('Cameras:', data);
+      } catch (e) {
+        log('List cameras failed:', e.message || e);
+      }
+    };
+
+    function ensureVideoEl(cameraId) {
+      let video = document.querySelector('video[data-camera="' + cameraId + '"]');
+      if (!video) {
+        video = document.createElement('video');
+        video.autoplay = true; video.playsInline = true; video.muted = true;
+        video.setAttribute('data-camera', cameraId);
+        video.title = cameraId;
+        videosEl.appendChild(video);
+      }
+      return video;
+    }
+
+    $('startLiveBtn').onclick = async () => {
+      if (!userId) { alert('Login first'); return; }
+      if (pc) { alert('Already started'); return; }
+      $('liveStatus').textContent = 'Starting...';
+      try {
+        const cfgRes = await fetch(API_BASE + '/api/webrtc-config?user_id=' + encodeURIComponent(userId));
+        const cfg = await cfgRes.json();
+        if (!cfgRes.ok) throw new Error(cfg.detail || cfgRes.statusText);
+
+        pc = new RTCPeerConnection({ iceServers: cfg.ice_servers });
+        log('RTCPeerConnection created');
+
+        pc.oniceconnectionstatechange = () => {
+          log('ICE state:', pc.iceConnectionState);
+          $('liveStatus').textContent = pc.iceConnectionState;
+        };
+        pc.onconnectionstatechange = () => {
+          log('Connection state:', pc.connectionState);
+        };
+        pc.onicegatheringstatechange = () => {
+          log('ICE gathering state:', pc.iceGatheringState);
+        };
+
+        pc.ontrack = (ev) => {
+          const track = ev.track;
+          const cameraId = track.id || 'unknown-camera';
+          log('Remote track:', cameraId, track.kind);
+          let stream = streamsByCamera.get(cameraId);
+          if (!stream) {
+            stream = new MediaStream();
+            streamsByCamera.set(cameraId, stream);
+            const video = ensureVideoEl(cameraId);
+            video.srcObject = stream;
+          }
+          stream.addTrack(track);
+        };
+
+        const viewerId = 'viewer:' + userId;
+        const cameraId = 'camera:' + userId;
+
+        ws = new WebSocket(cfg.signaling_url);
+        ws.onopen = () => { log('WS connected:', cfg.signaling_url); };
+        ws.onclose = (e) => { log('WS closed:', e.code, e.reason || ''); };
+        ws.onerror = (e) => { log('WS error:', e); };
+        ws.onmessage = async (event) => {
+          try {
+            const msg = JSON.parse(event.data);
+            const typ = msg.type;
+            if (typ === 'offer') {
+              log('Received offer');
+              await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+              const answer = await pc.createAnswer();
+              await pc.setLocalDescription(answer);
+              ws.send(JSON.stringify({ type: 'answer', from: viewerId, to: cameraId, sdp: answer.sdp }));
+              log('Sent answer');
+            } else if (typ === 'ice') {
+              const c = (msg.candidate || {});
+              if (!c.candidate) {
+                await pc.addIceCandidate(null);
+                log('Remote ICE end');
+              } else {
+                await pc.addIceCandidate({ candidate: c.candidate, sdpMid: c.sdpMid, sdpMLineIndex: c.sdpMLineIndex });
+                log('Added remote ICE');
+              }
+            } else if (typ === 'pong') {
+              // ignore
+            } else {
+              log('Unknown message:', msg);
+            }
+          } catch (e) {
+            log('WS message error:', e.message || e);
+          }
+        };
+
+        pc.onicecandidate = (ev) => {
+          const cand = ev.candidate;
+          if (!ws || ws.readyState !== WebSocket.OPEN) return;
+          if (!cand) {
+            ws.send(JSON.stringify({ type: 'ice', from: viewerId, to: cameraId, candidate: {} }));
+            log('Local ICE end');
+            return;
+          }
+          ws.send(JSON.stringify({ type: 'ice', from: viewerId, to: cameraId, candidate: cand }));
+          log('Sent local ICE');
+        };
+
+        $('liveStatus').textContent = 'Waiting for camera offer...';
+        log('Ready. Ensure the camera sender (live-sender.py) is running, and connected as', cameraId);
+      } catch (e) {
+        $('liveStatus').textContent = 'Error';
+        log('Start live failed:', e.message || e);
+        alert('Start live failed: ' + e);
+        cleanup();
+      }
+    };
+
+    $('stopLiveBtn').onclick = () => {
+      cleanup();
+      $('liveStatus').textContent = 'Stopped';
+    };
+
+    function cleanup() {
+      if (ws) {
+        try { ws.close(); } catch {}
+        ws = null;
+      }
+      if (pc) {
+        try { pc.getSenders().forEach(s => s.track && s.track.stop()); } catch {}
+        try { pc.getReceivers().forEach(r => r.track && r.track.stop()); } catch {}
+        try { pc.close(); } catch {}
+        pc = null;
+      }
+      streamsByCamera.clear();
+    }
+  </script>
+</body>
+</html>
