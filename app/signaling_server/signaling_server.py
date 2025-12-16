@@ -66,10 +66,14 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     }
                     await websocket.send_text(json.dumps(offer_msg))
                     logger.info(
-                        f"📤 Replayed stored offer from '{camera_peer_id}' to late viewer '{client_id}'"
+                        f"📤 Replayed stored offer from '{camera_peer_id}' to late viewer '{client_id}' on connect"
+                    )
+                else:
+                    logger.info(
+                        f"🙈 No stored offer available for camera '{camera_peer_id}' when viewer '{client_id}' connected"
                     )
         except Exception as e:
-            logger.error(f"❌ Failed to replay stored offer to '{client_id}': {e}")
+            logger.error(f"❌ Failed to replay stored offer to '{client_id}' on connect: {e}")
     
     try:
         while True:
@@ -140,6 +144,32 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     except Exception as e:
                         logger.error(f"❌ Failed to forward ICE-complete: {e}")
             
+            # ===== HELLO: Viewer explicitly requests latest offer from its camera =====
+            elif msg_type == "hello":
+                if not is_camera:
+                    try:
+                        if ":" in client_id:
+                            _, user_part = client_id.split(":", 1)
+                            camera_peer_id = f"camera:{user_part}"
+                            camera_client = clients.get(camera_peer_id)
+                            if camera_client and camera_client.last_offer:
+                                offer_msg = {
+                                    "type": "offer",
+                                    "from": camera_peer_id,
+                                    "to": client_id,
+                                    "sdp": camera_client.last_offer,
+                                }
+                                await websocket.send_text(json.dumps(offer_msg))
+                                logger.info(
+                                    f"📤 Replayed stored offer from '{camera_peer_id}' to viewer '{client_id}' on hello"
+                                )
+                            else:
+                                logger.info(
+                                    f"🙈 No stored offer available for camera '{camera_peer_id}' on hello from '{client_id}'"
+                                )
+                    except Exception as e:
+                        logger.error(f"❌ Failed to handle hello from '{client_id}': {e}")
+
             # ===== PING: Keep-alive heartbeat =====
             elif msg_type == "ping":
                 try:

@@ -219,7 +219,16 @@
         const cameraId = 'camera:' + userId;
 
         ws = new WebSocket(cfg.signaling_url);
-        ws.onopen = () => { log('WS connected:', cfg.signaling_url); };
+        ws.onopen = () => {
+          log('WS connected:', cfg.signaling_url);
+          // Explicitly ask signaling server for the latest offer from this user's camera.
+          try {
+            ws.send(JSON.stringify({ type: 'hello', from: viewerId, to: cameraId }));
+            log('Sent hello to signaling server');
+          } catch (e) {
+            log('Failed to send hello:', e.message || e);
+          }
+        };
         ws.onclose = (e) => { log('WS closed:', e.code, e.reason || ''); };
         ws.onerror = (e) => { log('WS error:', e); };
         ws.onmessage = async (event) => {

@@ -17,10 +17,6 @@ from aiortc import (
 from aiortc.contrib.media import MediaPlayer
 from aiortc.contrib.signaling import candidate_from_sdp
 import websockets
-from av import VideoFrame
-import cv2
-import numpy as np
-from app.object_detection_part.object_detection import load_detector_from_env
 from app.db import get_cameras_collection
 
 # Load environment variables from .env file
@@ -30,10 +26,6 @@ load_dotenv()
 SIGNALING_WS = os.getenv("SIGNALING_WS")  # WebSocket server URL for signaling
 if not SIGNALING_WS:
     raise RuntimeError("SIGNALING_WS environment variable is required for live-sender")
-
-# ============ Detection Configuration ============
-ENABLE_DETECTION = os.getenv("ENABLE_DETECTION", "0").strip().lower() in ("1", "true", "yes", "on")
-DETECTION_FRAME_SKIP = int(os.getenv("DETECTION_FRAME_SKIP", "5"))  # Process every Nth frame (5 = every 5th frame)
 
 # ============ TURN Server Configuration (for NAT traversal) ============
 AWS_TURN_IP = os.getenv("AWS_TURN_IP")
@@ -68,16 +60,13 @@ class ProxyVideoTrack(VideoStreamTrack):
     WebRTC track ID so that the viewer can map incoming tracks back to
     the correct camera.
     """
-    def __init__(self, source_track, camera_id, detector=None, frame_skip: int = 0):
+    def __init__(self, source_track, camera_id):
         super().__init__()
         self.source = source_track
         self.label = camera_id
         # Use camera_id as the ID to ensure uniqueness across tracks
         self._id = camera_id
         print("========trackid========", camera_id)
-        self.detector = detector
-        self.frame_skip = max(0, int(frame_skip))
-        self._frame_index = 0
 
     @property
     def id(self):
@@ -90,47 +79,9 @@ class ProxyVideoTrack(VideoStreamTrack):
         return getattr(self.source, "kind", "video")
 
     async def recv(self):
-        """
-        Receive frame from source and optionally apply pose detection.
-        Returns annotated frame if detection is enabled, otherwise raw frame.
-        """
+        """Receive frame from source and forward it without modification."""
         frame = await self.source.recv()
-        
-        # If no detector, return raw frame
-        if not self.detector:
-            return frame
-        
-        idx = self._frame_index
-        self._frame_index += 1
-        
-        try:
-            # Skip frames based on DETECTION_FRAME_SKIP setting
-            # This reduces CPU load by processing fewer frames
-            if self.frame_skip and (idx % (self.frame_skip + 1)) != 0:
-                return frame
-            
-            # Convert frame to OpenCV format (BGR)
-            bgr = frame.to_ndarray(format="bgr24")
-            if bgr is None or bgr.size == 0:
-                return frame
-            
-            # Run pose detection on the frame  , yolo v8 pose detection while live detection
-            annotated_bgr, pose_detected = self.detector.annotate(bgr)
-            
-            # Validate annotated frame
-            if annotated_bgr is None or annotated_bgr.size == 0:
-                return frame
-            
-            # Convert back to VideoFrame format for WebRTC
-            new_frame = VideoFrame.from_ndarray(annotated_bgr, format="bgr24")
-            new_frame.pts = frame.pts
-            new_frame.time_base = frame.time_base
-            
-            return new_frame
-            
-        except Exception as e:
-            print(f"[pusher] ❌ Detection error on {self.label} frame {idx}: {e}")
-            return frame
+        return frame
 
 
 async def check_player_frames(player, label, timeout=3.0):
@@ -153,7 +104,7 @@ async def check_player_frames(player, label, timeout=3.0):
         return False
 
 
-async def run():
+async def run_single_session():
     pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=ICE_SERVERS))
     print(f"[pusher] PeerConnection created. TURN: {AWS_TURN_IP}:{AWS_TURN_PORT if AWS_TURN_IP else ''}")
 
@@ -174,8 +125,6 @@ async def run():
         print("[pusher] ICE gathering state:", pc.iceGatheringState)
 
     players = []
-    detector = None
-    last_fall_alert_time = 0
 
     cameras_coll = get_cameras_collection()
     distinct_user_ids = cameras_coll.distinct("user_id")
@@ -197,17 +146,6 @@ async def run():
         print(f"[pusher] ❌ No cameras found for user_id={user_id}")
         await pc.close()
         return
-
-    # Load YOLOv8 pose detector if detection is enabled
-    if ENABLE_DETECTION:
-        try:
-            detector = load_detector_from_env()
-            if detector:
-                print("[pusher] ✅ YOLOv8 Pose detector loaded")
-            else:
-                print("[pusher] ⚠️ Detection disabled")
-        except Exception as e:
-            print(f"[pusher] ❌ Detector error: {e}")
 
     async def create_player(rtsp_url, label):
         try:
@@ -256,7 +194,7 @@ async def run():
             print(f"[pusher] Skipping {label}: player is None")
             return False
         try:
-            proxied = ProxyVideoTrack(player.video, label, detector=detector, frame_skip=DETECTION_FRAME_SKIP)
+            proxied = ProxyVideoTrack(player.video, label)
             # Preferred approach: add a separate transceiver for each track.
             # We attempt to attach proxied directly to addTransceiver if supported.
             try:
@@ -345,9 +283,54 @@ async def run():
             # Keep track of connection state
             connection_established = False
             last_activity = time.time()
+            keepalive_task = None
 
-            # handle incoming messages with keep-alive
+            async def keepalive_loop():
+                """Send fall alerts and pings while connection is active.
+
+                If the peer connection enters a failed/closed state, proactively
+                close the signaling WebSocket so the current session can end and
+                a fresh one can be created by run_forever().
+                """
+                print("[pusher] Keep-alive loop started")
+                last_heartbeat = time.time()
+                try:
+                    while not ws.closed:
+                        await asyncio.sleep(1)
+                        current_time = time.time()
+
+                        # Monitor peer connection state
+                        if pc.connectionState in ["failed", "closed", "disconnected"]:
+                            print("[pusher] ⚠️ Peer connection state is", pc.connectionState,
+                                  "- closing signaling WebSocket to restart session")
+                            try:
+                                await ws.close()
+                            except Exception as e:
+                                print(f"[pusher] ⚠️ Error closing WebSocket after PC failure: {e}")
+                            break
+
+                        # Send keep-alive ping every 10 seconds to maintain signaling connection
+                        if current_time - last_heartbeat > 10:
+                            try:
+                                if ws and not ws.closed:
+                                    await ws.send(json.dumps({
+                                        "type": "ping",
+                                        "from": camera_client_id,
+                                        "to": viewer_client_id
+                                    }))
+                                    last_heartbeat = current_time
+                            except Exception as e:
+                                print(f"[pusher] Keep-alive ping failed: {e}")
+                                break
+                except asyncio.CancelledError:
+                    print("[pusher] Keep-alive loop cancelled")
+                    raise
+                except Exception as e:
+                    print(f"[pusher] Keep-alive loop error: {e}")
+
+            # handle incoming messages with separate keep-alive task
             try:
+                keepalive_task = asyncio.create_task(keepalive_loop())
                 async for raw in ws:
                     last_activity = time.time()
                     try:
@@ -387,57 +370,40 @@ async def run():
                 print("[pusher] Message handling cancelled")
                 raise
             finally:
-                # Keep connection alive indefinitely
-                if connection_established:
-                    print("[pusher] ✅ Connection established, maintaining stream indefinitely...")
+                if keepalive_task is not None:
+                    keepalive_task.cancel()
                     try:
-                        # Keep the connection open - send heartbeat periodically
-                        last_heartbeat = time.time()
-                        while pc.connectionState not in ["closed", "failed"]:
-                            await asyncio.sleep(1)
-                            current_time = time.time()
-                            
-                            # Check for fall detection and send alert
-                            if detector and detector.fall_detected:
-                                if current_time - last_fall_alert_time > 3:
-                                    try:
-                                        if ws and not ws.closed:
-                                            await ws.send(json.dumps({
-                                                "type": "fall_alert",
-                                                "from": camera_client_id,
-                                                "to": viewer_client_id
-                                            }))
-                                            print("[pusher] 🚨 Fall alert sent to viewer")
-                                            last_fall_alert_time = current_time
-                                    except Exception as e:
-                                        print(f"[pusher] Fall alert send failed: {e}")
-                            
-                            # Send keep-alive ping every 10 seconds to maintain signaling connection
-                            if current_time - last_heartbeat > 10:
-                                try:
-                                    if ws and not ws.closed:
-                                        await ws.send(json.dumps({
-                                            "type": "ping",
-                                            "from": camera_client_id,
-                                            "to": viewer_client_id
-                                        }))
-                                        last_heartbeat = current_time
-                                except Exception as e:
-                                    print(f"[pusher] Keep-alive ping failed: {e}")
-                                    break
-                            
-                            # Monitor connection state
-                            if pc.connectionState == "disconnected":
-                                print("[pusher] ⚠️ Connection disconnected, attempting recovery...")
-                                await asyncio.sleep(2)
-                    except Exception as e:
-                        print(f"[pusher] Keep-alive loop error: {e}")
+                        await keepalive_task
+                    except asyncio.CancelledError:
+                        pass
+                print("[pusher] Message loop finished, ending session")
 
     except Exception as e:
         print("[pusher] ❌ Signaling/WS exception:", e)
     finally:
+        for label, player in players:
+            try:
+                if player is not None:
+                    print(f"[pusher] Stopping player for {label}")
+                    player.stop()
+            except Exception as e:
+                print(f"[pusher] ⚠️ Error stopping player for {label}: {e}")
         print("[pusher] Closing peer connection")
         await pc.close()
+
+
+async def run_forever(retry_delay: float = 3.0):
+    while True:
+        print("[pusher] === Starting new WebRTC session ===")
+        try:
+            await run_single_session()
+        except asyncio.CancelledError:
+            print("[pusher] Streaming loop cancelled, shutting down")
+            raise
+        except Exception as e:
+            print(f"[pusher] ❌ Unexpected error in WebRTC session: {e}")
+        print(f"[pusher] Session ended, restarting in {retry_delay} seconds...")
+        await asyncio.sleep(retry_delay)
 
 
 if __name__ == "__main__":
@@ -445,11 +411,9 @@ if __name__ == "__main__":
     print("WebRTC Multi-Camera Pusher with YOLOv8 Pose Detection")
     print("User ID: will be resolved dynamically from MongoDB")
     print(f"Signaling URL: {SIGNALING_WS}")
-    print(f"Detection: {'ENABLED' if ENABLE_DETECTION else 'DISABLED'}")
-    print(f"Frame Skip: {DETECTION_FRAME_SKIP}")
     print("="*60)
     try:
-        asyncio.run(run())
+        asyncio.run(run_forever())
     except KeyboardInterrupt:
         print("\n[pusher] Stopped by user")
     except Exception as e:
