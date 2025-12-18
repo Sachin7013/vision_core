@@ -14,10 +14,12 @@ from aiortc import (
     RTCIceServer,
     VideoStreamTrack,
 )
-from aiortc.contrib.media import MediaPlayer
 from aiortc.contrib.signaling import candidate_from_sdp
 import websockets
+
 from app.db import get_cameras_collection
+from app.rule_engine.engine import process_frame_for_camera
+from app.streamer.rtsp_extractor import create_rtsp_player, check_player_frames
 
 # Load environment variables from .env file
 load_dotenv()
@@ -79,29 +81,15 @@ class ProxyVideoTrack(VideoStreamTrack):
         return getattr(self.source, "kind", "video")
 
     async def recv(self):
-        """Receive frame from source and forward it without modification."""
+        """Receive frame from source and hand it off to the rule engine.
+
+        The rule engine decides whether to run object detection, apply
+        any active agent rules, and annotate the frame. If there are no
+        active agents for this camera, or no rules match, the original
+        frame is returned unchanged.
+        """
         frame = await self.source.recv()
-        return frame
-
-
-async def check_player_frames(player, label, timeout=3.0):
-    """Try to receive a single frame from player.video to ensure the RTSP source is healthy."""
-    if not getattr(player, "video", None):
-        print(f"[debug] {label}: No video attribute on player")
-        return False
-    try:
-        frame = await asyncio.wait_for(player.video.recv(), timeout=timeout)
-        if frame is None:
-            print(f"[debug] {label}: recv returned None")
-            return False
-        print(f"[debug] {label}: got frame pts={getattr(frame, 'pts', '?')} size={getattr(frame,'width','?')}x{getattr(frame,'height','?')}")
-        return True
-    except asyncio.TimeoutError:
-        print(f"[debug] {label}: recv() timed out after {timeout}s")
-        return False
-    except Exception as e:
-        print(f"[debug] {label}: recv() exception: {e}")
-        return False
+        return process_frame_for_camera(self.label, frame)
 
 
 async def run_single_session():
@@ -148,26 +136,11 @@ async def run_single_session():
         return
 
     async def create_player(rtsp_url, label):
-        try:
-            print(f"[pusher] Creating MediaPlayer for {label}: {rtsp_url}")
-            player = MediaPlayer(rtsp_url, format="rtsp",
-                                 options={"rtsp_transport":"tcp", "stimeout":"5000000"})
-            await asyncio.sleep(0.5)  # allow ffmpeg to spin up
-            ok = await check_player_frames(player, label, timeout=3.0)
-            if not ok:
-                # try one more short retry
-                print(f"[pusher] {label}: retrying frame check")
-                await asyncio.sleep(1.0)
-                ok = await check_player_frames(player, label, timeout=3.0)
-            if not ok:
-                print(f"[pusher] ⚠️ {label}: no frames detected (RTSP may be wrong or camera offline)")
-            else:
-                print(f"[pusher] ✅ {label}: frames detected")
+        result = await create_rtsp_player(rtsp_url, label)
+        label, player, ok = result
+        if player is not None:
             players.append((label, player))
-            return (label, player, ok)
-        except Exception as e:
-            print(f"[pusher] ❌ Error creating player for {label}: {e}")
-            return (label, None, False)
+        return result
 
     # create players for each camera of this user
     player_infos = []

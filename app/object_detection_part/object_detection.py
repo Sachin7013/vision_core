@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 from pathlib import Path
 from datetime import datetime
+from typing import Any, Dict, List
 from ultralytics import YOLO
 
 
@@ -136,6 +137,52 @@ class YOLOv8PoseDetector:
             return bgr, False
 
 
+def annotate_frame_with_detections(
+    frame_bgr: np.ndarray,
+    detections: List[Dict[str, Any]],
+) -> np.ndarray:
+    """Draw bounding boxes for the given detections on a frame.
+
+    This helper is intentionally simple so it stays easy to understand.
+    """
+    import cv2
+
+    output = frame_bgr.copy()
+    for det in detections:
+        x1, y1, x2, y2 = det["bbox"]
+        label = det.get("class_name", "obj")
+        conf = det.get("confidence", 0.0)
+        text = f"{label} {conf:.2f}"
+        cv2.rectangle(output, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(output, text, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+    return output
+
+
+def run_detection(model: YOLO, frame_bgr: np.ndarray) -> List[Dict[str, Any]]:
+    """Run YOLO object detection on a frame and return normalized results."""
+    results = model(frame_bgr, verbose=False)
+    dets: List[Dict[str, Any]] = []
+    if not results:
+        return dets
+    res = results[0]
+    names = res.names
+    boxes = res.boxes
+    if boxes is None:
+        return dets
+    for box in boxes:
+        cls_idx = int(box.cls[0]) if box.cls is not None else -1
+        conf = float(box.conf[0]) if box.conf is not None else 0.0
+        x1, y1, x2, y2 = box.xyxy[0].tolist()
+        dets.append(
+            {
+                "class_name": names.get(cls_idx, str(cls_idx)),
+                "confidence": conf,
+                "bbox": [int(x1), int(y1), int(x2), int(y2)],
+            }
+        )
+    return dets
+
+
 def load_detector_from_env():
     enable_detection = os.getenv("ENABLE_DETECTION", "0")
     if enable_detection != "1":
@@ -143,4 +190,3 @@ def load_detector_from_env():
     conf = float(os.getenv("DETECTION_CONF", "0.5"))
     device = os.getenv("DETECTION_DEVICE", "cpu")
     return YOLOv8PoseDetector(conf=conf, device=device)
-

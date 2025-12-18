@@ -56,7 +56,9 @@
             <span class="pill" id="loginStatus">Not logged in</span>
           </div>
         </div>
+      </div>
 
+      <div class="col">
         <div class="card">
           <h2>Add Camera</h2>
           <label>Camera ID (id)</label>
@@ -77,16 +79,56 @@
 
       <div class="col">
         <div class="card">
-          <h2>Live Viewer</h2>
-          <div style="display:flex; gap:8px; flex-wrap:wrap;">
-            <button id="startLiveBtn">Start Live</button>
-            <button id="stopLiveBtn" class="secondary">Stop</button>
-            <span class="pill" id="liveStatus">Idle</span>
+          <h2>Add Agent (simple)</h2>
+          <label>Agent ID</label>
+          <input id="agentId" type="text" placeholder="agent_person_cam1" />
+          <label>Task Name</label>
+          <input id="agentName" type="text" placeholder="Person detection on cam-1" />
+          <label>Task Type</label>
+          <input id="agentTaskType" type="text" value="object_detection" />
+          <label>Camera ID</label>
+          <input id="agentCameraId" type="text" placeholder="cam-1" />
+          <label>RTSP URL (same as camera)</label>
+          <input id="agentRtsp" type="url" placeholder="rtsp://user:pass@192.168.1.6:554/stream1" />
+          <label>Model ID</label>
+          <input id="agentModelId" type="text" placeholder="yolov8n.pt" value="yolov8n.pt" />
+          <label>Target Class</label>
+          <input id="agentClass" type="text" placeholder="person" value="person" />
+          <label>Rule Type</label>
+          <input id="agentRuleType" type="text" value="class_presence" />
+          <label>Rule Label</label>
+          <input id="agentRuleLabel" type="text" placeholder="person" />
+          <label>Rule Action</label>
+          <input id="agentRuleAction" type="text" placeholder="any person detected give a alert" />
+          <label>FPS</label>
+          <input id="agentFps" type="number" min="1" value="5" />
+          <label>Run Mode</label>
+          <select id="agentRunMode">
+            <option value="continuous">continuous</option>
+            <option value="interval">interval</option>
+          </select>
+          <label>Start At</label>
+          <input id="agentStartAt" type="datetime-local" />
+          <label>End At</label>
+          <input id="agentEndAt" type="datetime-local" />
+          <div style="margin-top:10px; display:flex; gap:8px;">
+            <button id="addAgentBtn">Add Agent</button>
+            <button id="listAgentsBtn" class="secondary">List Agents</button>
           </div>
-          <div class="videos" id="videos"></div>
-          <div class="status" id="log" style="margin-top:12px;"></div>
+          <div id="agentsList" class="status" style="margin-top:10px;"></div>
         </div>
       </div>
+    </div>
+
+    <div class="card">
+      <h2>Live Viewer</h2>
+      <div style="display:flex; gap:8px; flex-wrap:wrap;">
+        <button id="startLiveBtn">Start Live</button>
+        <button id="stopLiveBtn" class="secondary">Stop</button>
+        <span class="pill" id="liveStatus">Idle</span>
+      </div>
+      <div class="videos" id="videos"></div>
+      <div class="status" id="log" style="margin-top:12px;"></div>
     </div>
   </main>
 
@@ -163,6 +205,115 @@
         log('Cameras:', data);
       } catch (e) {
         log('List cameras failed:', e.message || e);
+      }
+    };
+
+    function buildLocalIsoString(date) {
+      const pad = (n) => String(n).padStart(2, '0');
+      return (
+        date.getFullYear() + '-' +
+        pad(date.getMonth() + 1) + '-' +
+        pad(date.getDate()) + 'T' +
+        pad(date.getHours()) + ':' +
+        pad(date.getMinutes()) + ':' +
+        pad(date.getSeconds())
+      );
+    }
+
+    function normalizeDateTimeLocal(val) {
+      if (!val) return '';
+      // datetime-local typically returns 'YYYY-MM-DDTHH:MM'. Append seconds if missing.
+      if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(val)) {
+        return val + ':00';
+      }
+      return val;
+    }
+
+    $('addAgentBtn').onclick = async () => {
+      if (!userId) { alert('Login first'); return; }
+
+      const agentId = $('agentId').value.trim();
+      const taskName = $('agentName').value.trim();
+      const taskType = $('agentTaskType').value.trim() || 'object_detection';
+      const cameraId = $('agentCameraId').value.trim();
+      const rtsp = $('agentRtsp').value.trim();
+      const modelId = $('agentModelId').value.trim();
+      const targetClass = $('agentClass').value.trim();
+      const ruleType = $('agentRuleType').value.trim() || 'class_presence';
+      const ruleLabel = $('agentRuleLabel').value.trim();
+      const ruleAction = $('agentRuleAction').value.trim();
+      const fpsStr = $('agentFps').value.trim();
+      const runMode = $('agentRunMode').value || 'continuous';
+      const startAtRaw = $('agentStartAt').value.trim();
+      const endAtRaw = $('agentEndAt').value.trim();
+
+      if (!agentId || !taskName || !taskType || !cameraId || !rtsp || !modelId || !targetClass || !ruleType || !ruleLabel || !fpsStr || !startAtRaw || !endAtRaw) {
+        alert('Fill all agent fields: ID, task name, task type, camera ID, RTSP, model ID, target class, rule type, rule label, FPS, start and end time');
+        return;
+      }
+
+      const fps = parseInt(fpsStr, 10);
+      if (!Number.isFinite(fps) || fps <= 0) {
+        alert('FPS must be a positive number');
+        return;
+      }
+
+      const startAt = normalizeDateTimeLocal(startAtRaw);
+      const endAt = normalizeDateTimeLocal(endAtRaw);
+      if (!startAt || !endAt) {
+        alert('Invalid start or end time');
+        return;
+      }
+
+      const payload = {
+        agent_id: agentId,
+        task_name: taskName,
+        task_type: taskType,
+        camera_id: cameraId,
+        source_uri: rtsp,
+        model_ids: [modelId],
+        fps: fps,
+        run_mode: runMode,
+        rules: [
+          {
+            type: ruleType,
+            class: targetClass,
+            label: ruleLabel || targetClass,
+            action: ruleAction || ('any ' + targetClass + ' detected give a alert')
+          }
+        ],
+        start_at: startAt,
+        end_at: endAt
+      };
+
+      try {
+        const res = await fetch(API_BASE + '/api/agents', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || res.statusText);
+        log('Agent saved:', data);
+        $('agentsList').textContent = JSON.stringify(data, null, 2);
+      } catch (e) {
+        log('Add agent failed:', e.message || e);
+        alert('Add agent failed: ' + e);
+      }
+    };
+
+    $('listAgentsBtn').onclick = async () => {
+      if (!userId) { alert('Login first'); return; }
+      const cameraId = $('agentCameraId').value.trim();
+      const qs = cameraId ? ('?camera_id=' + encodeURIComponent(cameraId)) : '';
+      try {
+        const res = await fetch(API_BASE + '/api/agents' + qs);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || res.statusText);
+        $('agentsList').textContent = JSON.stringify(data, null, 2);
+        log('Agents:', data);
+      } catch (e) {
+        log('List agents failed:', e.message || e);
       }
     };
 

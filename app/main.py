@@ -7,6 +7,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.cameras import router as cameras_router
+from app.api.agents import router as agents_router
+from app.agent_scheduler import start_agent_scheduler
 
 
 app = FastAPI(title="Vision Core Backend")
@@ -54,9 +56,16 @@ async def start_live_sender_background() -> None:
         pass
 
 
+@app.on_event("startup")
+async def start_background_schedulers() -> None:
+    """Start background tasks such as the agent status scheduler."""
+    await start_agent_scheduler()
+
+
 @app.get("/")
 async def root():
     return {"message": "Vision Core Backend is running"}
 
 
 app.include_router(cameras_router)
+app.include_router(agents_router)
