@@ -138,6 +138,9 @@
         video = document.createElement('video');
         video.autoplay = true; video.playsInline = true; video.muted = true;
         video.setAttribute('data-track', trackId);
+        video.addEventListener('loadedmetadata', () => {
+          try { video.play().catch(() => {}); } catch {}
+        });
         tile.appendChild(header);
         tile.appendChild(video);
         videosEl.appendChild(tile);
@@ -235,6 +238,7 @@
             const title = 'Agent: ' + info.agentId + ' (Camera: ' + info.cameraId + ')';
             const video = ensureVideoEl(key, title);
             video.srcObject = stream;
+            try { if (video.paused) video.play().catch(() => {}); } catch {}
           }
           stream.addTrack(track);
           log('Agent track:', info.agentId, 'camera:', info.cameraId);
@@ -314,6 +318,12 @@
         try { pc.close(); } catch {}
       }
       pc = null;
+      try {
+        document.querySelectorAll('#videos video').forEach(v => {
+          try { v.pause(); } catch {}
+          try { v.srcObject = null; } catch {}
+        });
+      } catch {}
       clearVideos();
     }
 

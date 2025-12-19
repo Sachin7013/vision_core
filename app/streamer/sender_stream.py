@@ -7,6 +7,7 @@ import json
 import os
 import time
 from dotenv import load_dotenv
+from fractions import Fraction
 from aiortc import (
     RTCPeerConnection,
     RTCSessionDescription,
@@ -115,7 +116,12 @@ class AgentVideoTrack(VideoStreamTrack):
         self.label = self._id
         self._label = f"agent:{agent_id}"
         self._hub = SharedFrameHub.instance()
-        self._last_pts = None
+        # Track the last source pts we saw to avoid emitting duplicates
+        self._last_src_pts = None
+        # Output timestamp base and origin for monotonically increasing pts
+        self._time_base = Fraction(1, 1000)  # milliseconds
+        self._t0 = None  # wall-clock origin for this track
+        self._last_out_pts = None
 
     @property
     def id(self) -> str:
@@ -128,8 +134,9 @@ class AgentVideoTrack(VideoStreamTrack):
     async def recv(self):
         """Return the next processed frame for this agent.
 
-        We poll the hub for a new frame on the agent channel and only emit
-        a frame when it changes (by pts) to avoid duplicates.
+        Pulls the latest processed frame from SharedFrameHub and re-stamps
+        it with a monotonically increasing pts/time_base to satisfy the
+        encoder even if the source pts resets or is non-monotonic.
         """
         channel = self._label  # 'agent:<agent_id>'
         while True:
@@ -137,12 +144,33 @@ class AgentVideoTrack(VideoStreamTrack):
             if frame is None:
                 await asyncio.sleep(0.01)
                 continue
-            pts = getattr(frame, "pts", None)
-            if self._last_pts is not None and pts == self._last_pts:
+
+            src_pts = getattr(frame, "pts", None)
+            if self._last_src_pts is not None and src_pts == self._last_src_pts:
                 await asyncio.sleep(0.005)
                 continue
-            self._last_pts = pts
-            return frame
+            self._last_src_pts = src_pts
+
+            # Build a safe, monotonic timestamp in milliseconds
+            now_ms = int(time.time() * 1000)
+            if self._t0 is None:
+                self._t0 = now_ms
+            out_pts = max(0, now_ms - self._t0)
+            if self._last_out_pts is not None and out_pts <= self._last_out_pts:
+                out_pts = self._last_out_pts + 1
+            self._last_out_pts = out_pts
+
+            try:
+                # Create a fresh frame to avoid mutating shared object
+                nd = frame.to_ndarray(format="bgr24")
+                new_frame = type(frame).from_ndarray(nd, format="bgr24")
+            except Exception:
+                # As a fallback, return the original frame
+                new_frame = frame
+
+            new_frame.pts = out_pts
+            new_frame.time_base = self._time_base
+            return new_frame
 
 
 async def run_single_session():
@@ -377,7 +405,8 @@ async def run_single_session():
             try:
                 if player is not None:
                     print(f"[pusher] Stopping player for {label}")
-                    player.stop()
+                    if hasattr(player, "stop"):
+                        player.stop()
             except Exception as e:
                 print(f"[pusher] ⚠️ Error stopping player for {label}: {e}")
         print("[pusher] Closing peer connection")
