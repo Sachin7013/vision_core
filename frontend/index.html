@@ -158,6 +158,7 @@
     let ws = null;
     let pc = null;
     const streamsByCamera = new Map();
+    const knownCameras = new Set();
 
     $('loginBtn').onclick = () => {
       const id = $('userId').value.trim();
@@ -325,6 +326,18 @@
         video.setAttribute('data-camera', cameraId);
         video.title = cameraId;
         videosEl.appendChild(video);
+        video.style.cursor = 'pointer';
+        if (!video.dataset.linked) {
+          video.addEventListener('click', () => {
+            if (!userId) { alert('Login first'); return; }
+            const url = new URL('./agents.html', window.location.href);
+            url.searchParams.set('user', userId);
+            url.searchParams.set('camera', cameraId);
+            url.searchParams.set('autostart', '1');
+            window.location.href = url.toString();
+          });
+          video.dataset.linked = '1';
+        }
       }
       return video;
     }
@@ -337,6 +350,22 @@
         const cfgRes = await fetch(API_BASE + '/api/webrtc-config?user_id=' + encodeURIComponent(userId));
         const cfg = await cfgRes.json();
         if (!cfgRes.ok) throw new Error(cfg.detail || cfgRes.statusText);
+
+        // Fetch and remember camera IDs for this user so we ignore agent tracks here.
+        knownCameras.clear();
+        try {
+          const camsRes = await fetch(API_BASE + '/api/cameras?user_id=' + encodeURIComponent(userId));
+          const camsData = await camsRes.json();
+          if (!camsRes.ok) throw new Error(camsData.detail || camsRes.statusText);
+          const camList = Array.isArray(camsData) ? camsData : (camsData.items || []);
+          for (const c of camList) {
+            const id = c.camera_id || c.id;
+            if (id) knownCameras.add(id);
+          }
+          log('Known cameras:', Array.from(knownCameras));
+        } catch (e) {
+          log('Fetching cameras failed:', e.message || e);
+        }
 
         pc = new RTCPeerConnection({ iceServers: cfg.ice_servers });
         log('RTCPeerConnection created');
@@ -354,13 +383,18 @@
 
         pc.ontrack = (ev) => {
           const track = ev.track;
-          const cameraId = track.id || 'unknown-camera';
-          log('Remote track:', cameraId, track.kind);
-          let stream = streamsByCamera.get(cameraId);
+          const trackId = track.id || 'unknown-track';
+          if (!knownCameras.has(trackId)) {
+            log('Ignoring non-camera track:', trackId);
+            return;
+          }
+          const camId = trackId;
+          log('Remote camera track:', camId, track.kind);
+          let stream = streamsByCamera.get(camId);
           if (!stream) {
             stream = new MediaStream();
-            streamsByCamera.set(cameraId, stream);
-            const video = ensureVideoEl(cameraId);
+            streamsByCamera.set(camId, stream);
+            const video = ensureVideoEl(camId);
             video.srcObject = stream;
           }
           stream.addTrack(track);

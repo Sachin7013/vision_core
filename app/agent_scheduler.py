@@ -15,29 +15,25 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
-from typing import List
+from typing import List, Dict
 
 from app.db import get_agents_collection
-from app.rule_engine.engine import AgentRuntime, build_agent_runtimes_for_camera
+from app.shared_hub.hub import SharedFrameHub
+from app.rule_engine.engine import (
+    AgentRuntime,
+    build_agent_runtime_from_doc,
+    process_frame_for_agent,
+)
+
+# Track background runner tasks per agent
+_agent_tasks: Dict[str, asyncio.Task] = {}
 
 
-async def _agent_status_loop(interval_seconds: int = 5) -> None:
-    """
-    Background task that updates agent status automatically.
-    
-    This runs continuously in the background checking the time.
-    
-    Status changes:
-    pending    → Agent not started yet (waiting for start_at time)
-    running    → Agent is active (between start_at and end_at)
-    terminated → Agent is done (end_at time has passed)
-    
-    Args:
-        interval_seconds: How often to check (in seconds)
-    """
+async def _agent_status_loop(interval_seconds: int = 10) -> None:
+
     coll = get_agents_collection()
     
-    print("⏰ Agent scheduler started (checks every 5 seconds)")
+    print("⏰ Agent scheduler started (checks every 10 seconds)")
 
     while True:
         # Get current time
@@ -52,21 +48,23 @@ async def _agent_status_loop(interval_seconds: int = 5) -> None:
                 end_at = agent_doc.get("end_at")
                 current_status = agent_doc.get("status", "pending")
                 agent_id = agent_doc.get("agent_id")
+                run_mode = str(agent_doc.get("run_mode", "scheduled")).lower()
 
                 # Skip if missing times
                 if not start_at or not end_at:
                     continue
 
                 # DECIDE THE NEW STATUS
-                if now < start_at:
-                    # Not yet time to start
-                    new_status = "pending"
-                elif start_at <= now < end_at:
-                    # Time is between start and end → RUN IT!
+                if run_mode == "continuous":
+                    # Always run regardless of time window
                     new_status = "running"
                 else:
-                    # Time has passed → STOP IT
-                    new_status = "terminated"
+                    if now < start_at:
+                        new_status = "pending"
+                    elif start_at <= now < end_at:
+                        new_status = "running"
+                    else:
+                        new_status = "terminated"
 
                 # If status changed, update database
                 if new_status != current_status:
@@ -76,6 +74,18 @@ async def _agent_status_loop(interval_seconds: int = 5) -> None:
                     )
                     print(f"📊 Agent '{agent_id}': {current_status} → {new_status}")
 
+                # Ensure runner is started/stopped based on effective status
+                effective_status = new_status
+                if effective_status == "running":
+                    if agent_id not in _agent_tasks:
+                        runtime = build_agent_runtime_from_doc(agent_doc)
+                        if runtime is not None:
+                            _agent_tasks[agent_id] = asyncio.create_task(_run_agent(runtime))
+                else:
+                    task = _agent_tasks.pop(agent_id, None)
+                    if task is not None:
+                        task.cancel()
+
         except Exception as exc:
             print(f"⚠️ Error in scheduler: {exc}")
             # Keep running even if error occurs (auto-recovery)
@@ -84,54 +94,22 @@ async def _agent_status_loop(interval_seconds: int = 5) -> None:
         await asyncio.sleep(interval_seconds)
 
 
-def get_running_agents_for_camera(camera_id: str) -> List[AgentRuntime]:
-    """
-    Get all ACTIVE agents for a camera RIGHT NOW.
-    
-    This is the key function that says:
-    "Which agents should process frames for this camera?"
-    
-    IMPORTANT: Only agents with status='running' are returned!
-    
-    Args:
-        camera_id: Which camera
-    
-    Returns:
-        List of agents ready to use (empty list if none running)
-    
-    EXAMPLE:
-    If we have 3 agents on camera "cam01":
-    - agent_A: status='pending' (not time yet)
-    - agent_B: status='running' (active!)
-    - agent_C: status='terminated' (already done)
-    
-    This function returns ONLY [agent_B]
-    """
-    return build_agent_runtimes_for_camera(camera_id)
+async def _run_agent(runtime: AgentRuntime) -> None:
+    """Continuously pull latest frames for the agent's camera and process at the agent's FPS."""
+    hub = SharedFrameHub.instance()
+    interval = 1.0 / max(1, int(runtime.fps or 1))
+    channel_out = f"agent:{runtime.agent_id}"
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            frame = hub.get_latest(runtime.camera_id)
+            if frame is None:
+                continue
+            processed = process_frame_for_agent(runtime, frame)
+            hub.publish(channel_out, processed)
+    except asyncio.CancelledError:
+        return
 
 
 async def start_agent_scheduler() -> None:
-    """Start the background agent status scheduler.
-
-    This should be called from FastAPI's startup event; it spawns a
-    detached asyncio task that runs for the lifetime of the process.
-
-    RESPONSIBILITIES:
-        1. Continuously updates agent status based on timing
-        2. Maintains "source of truth" in database for agent state
-        3. Does NOT execute agents (that's engine.py's job)
-
-    FLOW DIAGRAM:
-        start_agent_scheduler()
-            ↓
-        _agent_status_loop() [runs continuously]
-            ↓
-        Updates agent.status in database every 50 seconds
-            ↓
-        When status='running', engine.py picks up the agent
-            ↓
-        engine.py calls get_running_agents_for_camera()
-            ↓
-        Only running agents are processed for frame detection
-    """
     asyncio.create_task(_agent_status_loop())

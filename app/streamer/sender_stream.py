@@ -18,8 +18,13 @@ from aiortc.contrib.signaling import candidate_from_sdp
 import websockets
 
 from app.db import get_cameras_collection
-from app.rule_engine.engine import process_frame_for_camera
-from app.streamer.rtsp_extractor import create_rtsp_player, check_player_frames
+from app.db import get_agents_collection
+from app.streamer.rtsp_extractor import (
+    create_rtsp_player,
+    fanout_frame,
+)
+from app.shared_hub.hub import SharedFrameHub
+from app.agent_scheduler import start_agent_scheduler
 
 # Load environment variables from .env file
 load_dotenv()
@@ -68,7 +73,6 @@ class ProxyVideoTrack(VideoStreamTrack):
         self.label = camera_id
         # Use camera_id as the ID to ensure uniqueness across tracks
         self._id = camera_id
-        print("========trackid========", camera_id)
 
     @property
     def id(self):
@@ -89,16 +93,61 @@ class ProxyVideoTrack(VideoStreamTrack):
         frame is returned unchanged.
         """
         frame = await self.source.recv()
-        return process_frame_for_camera(self.label, frame)
+        # Publish frame to shared hub for agents (if any are running), while
+        # continuing the normal streaming path unchanged for the caller.
+        fanout_frame(self.label, frame)
+        # Return RAW frame to keep the main live stream unprocessed.
+        return frame
+
+
+class AgentVideoTrack(VideoStreamTrack):
+    """Video track that outputs processed frames for a specific agent.
+
+    Frames are pulled from SharedFrameHub channel 'agent:{agent_id}'. The
+    track ID is set to '<camera_id>-<agent_id>' to keep it unique and
+    discoverable by the viewer.
+    """
+    def __init__(self, camera_id: str, agent_id: str) -> None:
+        super().__init__()
+        self.camera_id = camera_id
+        self.agent_id = agent_id
+        self._id = f"{camera_id}||{agent_id}"
+        self.label = self._id
+        self._label = f"agent:{agent_id}"
+        self._hub = SharedFrameHub.instance()
+        self._last_pts = None
+
+    @property
+    def id(self) -> str:
+        return self._id
+
+    @property
+    def kind(self) -> str:
+        return "video"
+
+    async def recv(self):
+        """Return the next processed frame for this agent.
+
+        We poll the hub for a new frame on the agent channel and only emit
+        a frame when it changes (by pts) to avoid duplicates.
+        """
+        channel = self._label  # 'agent:<agent_id>'
+        while True:
+            frame = self._hub.get_latest(channel)
+            if frame is None:
+                await asyncio.sleep(0.01)
+                continue
+            pts = getattr(frame, "pts", None)
+            if self._last_pts is not None and pts == self._last_pts:
+                await asyncio.sleep(0.005)
+                continue
+            self._last_pts = pts
+            return frame
 
 
 async def run_single_session():
     pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=ICE_SERVERS))
     print(f"[pusher] PeerConnection created. TURN: {AWS_TURN_IP}:{AWS_TURN_PORT if AWS_TURN_IP else ''}")
-
-    @pc.on("iceconnectionstatechange")
-    def on_ice_state():
-        print("[pusher] ICE state:", pc.iceConnectionState)
 
     @pc.on("connectionstatechange")
     def on_conn_state():
@@ -107,10 +156,6 @@ async def run_single_session():
             print("[pusher] ⚠️ Connection failed, will attempt to recover")
         elif pc.connectionState == "disconnected":
             print("[pusher] ⚠️ Connection disconnected, waiting for reconnection")
-
-    @pc.on("icegatheringstatechange")
-    def on_gather_state():
-        print("[pusher] ICE gathering state:", pc.iceGatheringState)
 
     players = []
 
@@ -160,48 +205,36 @@ async def run_single_session():
         await pc.close()
         return
 
-    # Add separate transceivers: one per camera. This forces separate m=video lines in SDP.
-    async def add_transceiver_for(player_tuple):
-        label, player = player_tuple
-        if player is None:
-            print(f"[pusher] Skipping {label}: player is None")
-            return False
-        try:
-            proxied = ProxyVideoTrack(player.video, label)
-            # Preferred approach: add a separate transceiver for each track.
-            # We attempt to attach proxied directly to addTransceiver if supported.
-            try:
-                transceiver = pc.addTransceiver(proxied, direction="sendonly")
-                # Some aiortc versions return a transceiver; the sender will be created.
-                print(f"[pusher] Added transceiver for {label}. transceiver={transceiver}")
-            except TypeError:
-                # Fallback: add transceiver by kind, then replace sender.track
-                transceiver = pc.addTransceiver(kind="video", direction="sendonly")
-                sender = transceiver.sender
-                try:
-                    # replace_track may be available; try it.
-                    await sender.replace_track(proxied)
-                    print(f"[pusher] Replaced transceiver sender.track for {label}")
-                except Exception:
-                    # fallback to addTrack (less ideal)
-                    sender = pc.addTrack(proxied)
-                    print(f"[pusher] Fallback: used addTrack for {label}; sender={sender}")
-            # Log sender info if possible
-            try:
-                s = transceiver.sender
-                print(f"[pusher] sender for {label}: id={getattr(s,'id',None)} track={getattr(s,'track',None)}")
-            except Exception:
-                pass
-            return True
-        except Exception as e:
-            print(f"[pusher] ❌ Error adding transceiver for {label}: {e}")
-            return False
-
-    # Add transceivers for each created player
+    # Add one video track per camera (RAW streams)
     for label, player, _ok in active_infos:
-        await add_transceiver_for((label, player))
+        if player is None:
+            continue
+        proxied = ProxyVideoTrack(player.video, label)
+        pc.addTrack(proxied)
+    print(f"[pusher] Added {len(active_infos)} camera track(s)")
 
-    print(f"[pusher] Completed adding transceivers for {len(active_infos)} cameras")
+    # Add a video track for each agent (processed streams). We do not filter by status
+    # so that viewers can connect before an agent transitions to 'running'. Tracks will
+    # start producing frames once available.
+    try:
+        camera_ids = [c.get("camera_id") for c in camera_docs if c.get("camera_id")]
+        agents_coll = get_agents_collection()
+        running_agents = list(agents_coll.find({
+            "camera_id": {"$in": camera_ids},
+        }))
+
+        added_agents = 0
+        for agent_doc in running_agents:
+            agent_id = agent_doc.get("agent_id")
+            camera_id = agent_doc.get("camera_id")
+            if not agent_id or not camera_id:
+                continue
+            track = AgentVideoTrack(camera_id=camera_id, agent_id=agent_id)
+            pc.addTrack(track)
+            added_agents += 1
+        print(f"[pusher] Added {added_agents} agent track(s)")
+    except Exception as e:
+        print(f"[pusher] ⚠️ Failed to add agent tracks: {e}")
 
     camera_client_id = f"camera:{user_id}"
     viewer_client_id = f"viewer:{user_id}"
@@ -218,11 +251,8 @@ async def run_single_session():
             async def on_local_ice(candidate):
                 try:
                     if candidate is None:
-                        print("[pusher] ✅ Local ICE gathering finished")
                         await ws.send(json.dumps({"type":"ice","from":camera_client_id,"to":viewer_client_id,"candidate":{}}))
                         return
-                    if "relay" in candidate.to_sdp():
-                        print("[pusher] 🔄 Sending TURN candidate")
                     msg = {
                         "type":"ice",
                         "from": camera_client_id,
@@ -234,7 +264,6 @@ async def run_single_session():
                         }
                     }
                     await ws.send(json.dumps(msg))
-                    print("[pusher] Sent ICE candidate")
                 except Exception as e:
                     print("[pusher] ❌ Error sending ICE candidate:", e)
 
@@ -242,11 +271,6 @@ async def run_single_session():
             print("[pusher] Creating SDP offer...")
             offer = await pc.createOffer()
             await pc.setLocalDescription(offer)
-            print("[pusher] Local description (offer) set. Printing short SDP for debug:")
-            sdp = pc.localDescription.sdp
-            print("----- SDP START (first 1600 chars) -----")
-            print(sdp[:1600])
-            print("----- SDP END -----")
 
             # send offer
             offer_msg = {"type":"offer","from": camera_client_id, "to": viewer_client_id, "sdp": pc.localDescription.sdp}
@@ -254,8 +278,6 @@ async def run_single_session():
             print("[pusher] ✅ Offer sent to viewer")
 
             # Keep track of connection state
-            connection_established = False
-            last_activity = time.time()
             keepalive_task = None
 
             async def keepalive_loop():
@@ -305,7 +327,6 @@ async def run_single_session():
             try:
                 keepalive_task = asyncio.create_task(keepalive_loop())
                 async for raw in ws:
-                    last_activity = time.time()
                     try:
                         message = json.loads(raw)
                     except Exception as e:
@@ -314,12 +335,10 @@ async def run_single_session():
 
                     typ = message.get("type")
                     if typ == "answer":
-                        print("[pusher] Received answer: setting remote description")
                         try:
                             answer = RTCSessionDescription(sdp=message["sdp"], type="answer")
                             await pc.setRemoteDescription(answer)
                             print("[pusher] ✅ Remote description set")
-                            connection_established = True
                         except Exception as e:
                             print("[pusher] ❌ setRemoteDescription failed:", e)
                     elif typ == "ice":
@@ -366,6 +385,13 @@ async def run_single_session():
 
 
 async def run_forever(retry_delay: float = 3.0):
+    # Ensure the agent scheduler runs in the SAME process as the sender,
+    # so SharedFrameHub is shared and agent frames are produced here.
+    try:
+        await start_agent_scheduler()
+    except Exception as e:
+        print(f"[pusher] ⚠️ Failed to start agent scheduler in sender process: {e}")
+
     while True:
         print("[pusher] === Starting new WebRTC session ===")
         try:

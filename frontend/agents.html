@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Agent Streams Viewer</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; background:#0b1220; color:#f2f5f9; }
+    header { padding: 16px 20px; background:#11182a; border-bottom:1px solid #1a2340; display:flex; align-items:center; gap:12px; }
+    header a { color:#9fb3ff; text-decoration:none; font-size:13px; }
+    main { padding: 20px; max-width: 1100px; margin: 0 auto; }
+    h1 { font-size: 18px; margin: 0; }
+    h2 { font-size: 16px; margin: 24px 0 8px; color: #9fb3ff; }
+    .card { background:#0f172a; border:1px solid #1a2340; border-radius: 10px; padding: 16px; margin: 12px 0; }
+    label { display:block; font-size:13px; color:#bcd; margin: 8px 0 4px; }
+    input[type=text], input[type=password], input[type=url] { width: 100%; padding:10px; border-radius:8px; border:1px solid #2a355b; background:#0c1326; color:#e9eef8; outline:none; }
+    input[type=text]:focus, input[type=password]:focus, input[type=url]:focus { border-color:#3a55ff; }
+    button { background:#3a55ff; color:#fff; border:none; padding:10px 14px; border-radius:8px; cursor:pointer; font-weight:600; }
+    button.secondary { background:#243055; }
+    button:disabled { opacity:.6; cursor:not-allowed; }
+    .grid { display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
+    .videos { display:grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap:12px; margin-top: 12px; }
+    .tile { border:1px solid #1a2340; border-radius:10px; overflow:hidden; background:#0c1326; }
+    .tile-header { padding:6px 10px; font-size:12px; color:#cfe; background:#101a33; border-bottom:1px solid #1a2340; }
+    .tile video { display:block; width:100%; height:auto; background:#000; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#152048; color:#cfe; font-size: 12px; border:1px solid #243055; }
+    .status { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size:12px; background:#0c1326; border:1px solid #1a2340; border-radius:8px; padding:10px; height:120px; overflow:auto; white-space:pre-wrap; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Agent Streams Viewer</h1>
+    <a href="./index.html">Home</a>
+  </header>
+  <main>
+    <div class="card">
+      <h2>Backend Settings</h2>
+      <div class="grid">
+        <div>
+          <label>Vision API Base (e.g. http://localhost:8000)</label>
+          <input id="apiBase" type="text" placeholder="http://localhost:8000" />
+        </div>
+        <div style="align-self:end; display:flex; gap:8px;">
+          <button id="saveApiBase">Save</button>
+          <span class="pill" id="apiBaseStatus">Not saved</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h2>Login</h2>
+        <label>User ID (owner_user_id)</label>
+        <input id="userId" type="text" placeholder="6928422b8c9933d948cfdc21" />
+        <div style="margin-top:10px; display:flex; gap:8px;">
+          <button id="loginBtn">Login</button>
+          <span class="pill" id="loginStatus">Not logged in</span>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Agent Viewer</h2>
+        <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+          <button id="startAgentsBtn">Start Agents</button>
+          <button id="stopAgentsBtn" class="secondary">Stop</button>
+          <span class="pill" id="agentsStatus">Idle</span>
+          <span class="pill" id="filterCamera" style="display:none;"></span>
+        </div>
+        <div class="videos" id="videos"></div>
+        <div class="status" id="log" style="margin-top:12px;"></div>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const logEl = $('log');
+    const videosEl = $('videos');
+
+    function log() {
+      const msg = Array.from(arguments).map(a => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
+      logEl.textContent += msg + '\n';
+      logEl.scrollTop = logEl.scrollHeight;
+      console.log('[agents-viewer]', ...arguments);
+    }
+
+    let API_BASE = localStorage.getItem('apiBase') || 'http://localhost:8000';
+    $('apiBase').value = API_BASE;
+    $('apiBaseStatus').textContent = 'Loaded';
+
+    $('saveApiBase').onclick = () => {
+      API_BASE = $('apiBase').value.trim() || API_BASE;
+      localStorage.setItem('apiBase', API_BASE);
+      $('apiBaseStatus').textContent = 'Saved';
+    };
+
+    let userId = '';
+    let ws = null;
+    let pc = null;
+    const streamsByTrack = new Map();
+    let agentIdSet = new Set();
+
+    // Read filters from URL (e.g., agents.html?user=USER123&camera=CAM-1)
+    const params = new URLSearchParams(window.location.search);
+    const FILTER_CAMERA_ID = params.get('camera') || '';
+    const preUserId = params.get('user') || '';
+
+    if (preUserId) {
+      userId = preUserId;
+      $('userId').value = preUserId;
+      $('loginStatus').textContent = 'Logged in as ' + preUserId + ' (link)';
+    }
+    if (FILTER_CAMERA_ID) {
+      const pill = $('filterCamera');
+      if (pill) { pill.textContent = 'Camera: ' + FILTER_CAMERA_ID; pill.style.display = 'inline-block'; }
+    }
+
+    $('loginBtn').onclick = () => {
+      const id = $('userId').value.trim();
+      if (!id) { alert('Enter user id'); return; }
+      userId = id;
+      $('loginStatus').textContent = 'Logged in as ' + id;
+      log('Logged in:', id);
+    };
+
+    function clearVideos() {
+      videosEl.innerHTML = '';
+      streamsByTrack.clear();
+    }
+
+    function ensureVideoEl(trackId, titleText) {
+      let video = document.querySelector('video[data-track="' + trackId + '"]');
+      if (!video) {
+        const tile = document.createElement('div');
+        tile.className = 'tile';
+        const header = document.createElement('div');
+        header.className = 'tile-header';
+        header.textContent = titleText || trackId;
+        video = document.createElement('video');
+        video.autoplay = true; video.playsInline = true; video.muted = true;
+        video.setAttribute('data-track', trackId);
+        tile.appendChild(header);
+        tile.appendChild(video);
+        videosEl.appendChild(tile);
+      }
+      return video;
+    }
+
+    function identifyAgentTrack(trackId) {
+      // Preferred format: "cameraId||agentId" to avoid hyphen ambiguity
+      const pipeIdx = trackId.indexOf('||');
+      if (pipeIdx > 0) {
+        const cameraId = trackId.slice(0, pipeIdx);
+        const agentId = trackId.slice(pipeIdx + 2);
+        return { cameraId, agentId };
+      }
+      // Backward-compat: try last hyphen split ("cameraId-agentId")
+      const idx = trackId.lastIndexOf('-');
+      if (idx <= 0 || idx >= trackId.length - 1) return null;
+      const cameraId = trackId.slice(0, idx);
+      const agentId = trackId.slice(idx + 1);
+      return { cameraId, agentId };
+    }
+
+    async function fetchUserAgents() {
+      const agentIds = new Set();
+      const cameraIds = [];
+      if (FILTER_CAMERA_ID) {
+        cameraIds.push(FILTER_CAMERA_ID);
+      } else {
+        const camsRes = await fetch(API_BASE + '/api/cameras?user_id=' + encodeURIComponent(userId));
+        const cams = await camsRes.json();
+        if (!camsRes.ok) throw new Error(cams.detail || camsRes.statusText);
+        for (const c of (Array.isArray(cams) ? cams : (cams.items || []))) {
+          const cid = c.camera_id || c.id; if (cid) cameraIds.push(cid);
+        }
+      }
+      for (const cid of cameraIds) {
+        try {
+          const res = await fetch(API_BASE + '/api/agents?camera_id=' + encodeURIComponent(cid));
+          const data = await res.json();
+          if (res.ok) {
+            const list = Array.isArray(data) ? data : (data.items || []);
+            for (const a of list) {
+              const running = a && (a.status ? String(a.status).toLowerCase() === 'running' : true);
+              const aid = a && (a.agent_id || a.id);
+              if (running && aid) agentIds.add(aid);
+            }
+          }
+        } catch (e) {
+          log('Agents fetch failed for camera', cid, e.message || e);
+        }
+      }
+      return agentIds;
+    }
+
+    async function startAgents() {
+      if (!userId) { alert('Login first'); return; }
+      if (pc) { alert('Already started'); return; }
+      $('agentsStatus').textContent = 'Starting...';
+      clearVideos();
+
+      try {
+        agentIdSet = await fetchUserAgents();
+        if (agentIdSet.size === 0) {
+          log('No running agents found for this user');
+        } else {
+          log('Running agents:', Array.from(agentIdSet));
+        }
+
+        const cfgRes = await fetch(API_BASE + '/api/webrtc-config?user_id=' + encodeURIComponent(userId));
+        const cfg = await cfgRes.json();
+        if (!cfgRes.ok) throw new Error(cfg.detail || cfgRes.statusText);
+
+        pc = new RTCPeerConnection({ iceServers: cfg.ice_servers });
+        log('RTCPeerConnection created');
+
+        pc.onconnectionstatechange = () => { log('Connection state:', pc.connectionState); };
+        pc.oniceconnectionstatechange = () => { log('ICE state:', pc.iceConnectionState); $('agentsStatus').textContent = pc.iceConnectionState; };
+
+        pc.ontrack = (ev) => {
+          const track = ev.track;
+          log('ontrack:', { id: track.id, label: track.label, kind: track.kind });
+          let info = identifyAgentTrack(track.id || '');
+          if (!info && track.label) {
+            info = identifyAgentTrack(track.label);
+          }
+          if (!info) return;
+          if (FILTER_CAMERA_ID && info.cameraId !== FILTER_CAMERA_ID) return;
+          if (agentIdSet && agentIdSet.size > 0 && !agentIdSet.has(info.agentId)) return;
+          const key = track.id;
+          let stream = streamsByTrack.get(key);
+          if (!stream) {
+            stream = new MediaStream();
+            streamsByTrack.set(key, stream);
+            const title = 'Agent: ' + info.agentId + ' (Camera: ' + info.cameraId + ')';
+            const video = ensureVideoEl(key, title);
+            video.srcObject = stream;
+          }
+          stream.addTrack(track);
+          log('Agent track:', info.agentId, 'camera:', info.cameraId);
+        };
+
+        const viewerId = 'viewer:' + userId;
+        const cameraId = 'camera:' + userId;
+
+        ws = new WebSocket(cfg.signaling_url);
+        ws.onopen = () => {
+          log('WS connected:', cfg.signaling_url);
+          try {
+            ws.send(JSON.stringify({ type: 'hello', from: viewerId, to: cameraId }));
+          } catch (e) { log('Hello send failed:', e.message || e); }
+        };
+        ws.onclose = (e) => { log('WS closed:', e.code, e.reason || ''); };
+        ws.onerror = (e) => { log('WS error:', e); };
+        ws.onmessage = async (event) => {
+          try {
+            const msg = JSON.parse(event.data);
+            const typ = msg.type;
+            if (typ === 'offer') {
+              await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+              const answer = await pc.createAnswer();
+              await pc.setLocalDescription(answer);
+              ws.send(JSON.stringify({ type: 'answer', from: viewerId, to: cameraId, sdp: answer.sdp }));
+              log('Answered offer');
+            } else if (typ === 'ice') {
+              const c = (msg.candidate || {});
+              if (!c.candidate) {
+                await pc.addIceCandidate(null);
+                log('Remote ICE end');
+              } else {
+                await pc.addIceCandidate({ candidate: c.candidate, sdpMid: c.sdpMid, sdpMLineIndex: c.sdpMLineIndex });
+                log('Added remote ICE');
+              }
+            }
+          } catch (e) {
+            log('WS message error:', e.message || e);
+          }
+        };
+
+        pc.onicecandidate = (ev) => {
+          const cand = ev.candidate;
+          if (!ws || ws.readyState !== WebSocket.OPEN) return;
+          if (!cand) {
+            ws.send(JSON.stringify({ type: 'ice', from: viewerId, to: cameraId, candidate: {} }));
+            log('Local ICE end');
+            return;
+          }
+          ws.send(JSON.stringify({ type: 'ice', from: viewerId, to: cameraId, candidate: cand }));
+          log('Sent local ICE');
+        };
+
+        $('agentsStatus').textContent = 'Waiting for offer...';
+      } catch (e) {
+        $('agentsStatus').textContent = 'Error';
+        log('Start agents failed:', e.message || e);
+        alert('Start agents failed: ' + e);
+        cleanup();
+      }
+    }
+
+    $('startAgentsBtn').onclick = () => { startAgents(); };
+
+    $('stopAgentsBtn').onclick = () => {
+      cleanup();
+      $('agentsStatus').textContent = 'Stopped';
+    };
+
+    function cleanup() {
+      try { if (ws) ws.close(); } catch {}
+      ws = null;
+      if (pc) {
+        try { pc.getSenders().forEach(s => s.track && s.track.stop()); } catch {}
+        try { pc.getReceivers().forEach(r => r.track && r.track.stop()); } catch {}
+        try { pc.close(); } catch {}
+      }
+      pc = null;
+      clearVideos();
+    }
+
+    // Auto-start when opened from camera click (autostart=1) or when both user and camera are supplied
+    const AUTO_START = (params.get('autostart') === '1') || (!!preUserId && !!FILTER_CAMERA_ID);
+    if (AUTO_START) {
+      // Give the page a brief moment to render before starting
+      setTimeout(() => { startAgents(); }, 100);
+    }
+  </script>
+</body>
+</html>

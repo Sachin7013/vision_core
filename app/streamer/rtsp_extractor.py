@@ -3,7 +3,18 @@ RTSP Extraction Module - Handles RTSP camera stream extraction and frame validat
 Uses MediaPlayer from aiortc to connect to RTSP sources.
 """
 import asyncio
+import time
 from aiortc.contrib.media import MediaPlayer
+from av import VideoFrame
+
+from app.shared_hub.hub import SharedFrameHub
+from app.db import get_agents_collection
+
+# Small cache to avoid pinging DB on every frame just to know if any agents
+# are running for a camera. The scheduler updates status every few seconds,
+# so a short TTL here is fine.
+_agent_presence_cache = {}
+_PRESENCE_TTL_SEC = 1.0
 
 
 async def check_player_frames(player, label, timeout=3.0):
@@ -75,3 +86,42 @@ async def create_rtsp_player(rtsp_url, label):
     except Exception as e:
         print(f"[pusher] ❌ Error creating player for {label}: {e}")
         return (label, None, False)
+
+
+def has_running_agents_for_camera(camera_id: str) -> bool:
+    """Return True if there is at least one running agent for this camera."""
+    now = time.time()
+    cached = _agent_presence_cache.get(camera_id)
+    if cached and (now - cached[0] < _PRESENCE_TTL_SEC):
+        return cached[1]
+    try:
+        coll = get_agents_collection()
+        # Quick existence check; limit=1 to keep it lightweight
+        has_any = coll.count_documents({"camera_id": camera_id, "status": "running"}, limit=1) > 0
+        _agent_presence_cache[camera_id] = (now, has_any)
+        return has_any
+    except Exception:
+        _agent_presence_cache[camera_id] = (now, False)
+        return False
+
+
+def fanout_frame(camera_id: str, frame: VideoFrame) -> VideoFrame:
+    """
+    Publish every camera frame to the shared hub so agents (when running)
+    can consume the latest frames immediately. Also return the original
+    frame unchanged for the live path.
+    """
+    try:
+        SharedFrameHub.instance().publish(camera_id, frame)
+    finally:
+        return frame
+
+
+def subscribe_to_camera(camera_id: str):
+    """Subscribe to shared frames for a camera; returns an asyncio.Queue."""
+    return SharedFrameHub.instance().subscribe(camera_id)
+
+
+def unsubscribe_from_camera(camera_id: str, q) -> None:
+    """Unsubscribe a previously created queue from the camera channel."""
+    SharedFrameHub.instance().unsubscribe(camera_id, q)
