@@ -44,6 +44,7 @@ def class_presence(
     matched = len(filtered) > 0
     
     print(f"✓ Rule '{rule.label}': Filtered {len(detections)} detections → {len(filtered)} matches")
+    print(f"✓ Rule '{rule.label}': all detected object => {detections}")
     
     return (matched, filtered)
 
@@ -91,5 +92,6 @@ def class_count(
     matched = count >= min_count
     
     print(f"✓ Rule '{rule.label}': Need {min_count} {target}, found {count}")
+    print(f"✓ Rule '{rule.label}': all detected object => {detections}")
     
     return (matched, filtered)
