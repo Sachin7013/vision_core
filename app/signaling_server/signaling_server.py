@@ -42,19 +42,30 @@ clients: Dict[str, Client] = {}
 # --------------------------------------------------
 # Helper functions
 # --------------------------------------------------
-def get_publisher_id_for_viewer(viewer_id: str) -> str | None:
-    """
-    viewer:<user>:<camera>            -> camera:<user>
-    viewer:<user>:<agent>             -> agent:<user>:<agent>
-    """
+# def get_publisher_id_for_viewer(viewer_id: str) -> str | None:
+#     """
+#     viewer:<user>:<camera>            -> camera:<user>
+#     viewer:<user>:<agent>             -> agent:<user>:<agent>
+#     """
+#     parts = viewer_id.split(":")
+#     if len(parts) == 2:
+#         # viewer:user
+#         return f"camera:{parts[1]}"
+#     if len(parts) == 3:
+#         # viewer:user:camera_id OR viewer:user:agent_id
+#         return f"agent:{parts[1]}:{parts[2]}"
+#     return None
+
+def get_publisher_id_for_viewer(viewer_id: str):
     parts = viewer_id.split(":")
-    if len(parts) == 2:
-        # viewer:user
-        return f"camera:{parts[1]}"
     if len(parts) == 3:
-        # viewer:user:camera_id OR viewer:user:agent_id
-        return f"agent:{parts[1]}:{parts[2]}"
+        # viewer:user:camera
+        return f"camera:{parts[1]}:{parts[2]}"
+    if len(parts) == 4:
+        # viewer:user:camera:agent
+        return f"agent:{parts[1]}:{parts[2]}:{parts[3]}"
     return None
+
 
 # --------------------------------------------------
 # WebSocket Endpoint
