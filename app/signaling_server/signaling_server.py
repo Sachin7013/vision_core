@@ -56,14 +56,23 @@ clients: Dict[str, Client] = {}
 #         return f"agent:{parts[1]}:{parts[2]}"
 #     return None
 
-def get_publisher_id_for_viewer(viewer_id: str):
+def get_publisher_id_for_viewer(viewer_id: str) -> str | None:
+    """
+    viewer:user:camera                -> camera:user:camera
+    viewer:user:camera:agent          -> agent:user:camera:agent
+    """
     parts = viewer_id.split(":")
+
     if len(parts) == 3:
         # viewer:user:camera
-        return f"camera:{parts[1]}:{parts[2]}"
+        _, user, camera = parts
+        return f"camera:{user}:{camera}"
+
     if len(parts) == 4:
         # viewer:user:camera:agent
-        return f"agent:{parts[1]}:{parts[2]}:{parts[3]}"
+        _, user, camera, agent = parts
+        return f"agent:{user}:{camera}:{agent}"
+
     return None
 
 
